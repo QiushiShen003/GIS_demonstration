@@ -1,0 +1,98 @@
+# Load necessary packages
+library(terra)
+library(dplyr)
+library(openxlsx)
+
+# 1. Set root directory and Excel file path (auto-normalize slashes)
+base_dir <- "GIS_Remote_Desktop_Work_Unit/Data Layers/Birds_Massive_Processing/eBird_Layers"
+excel_path <- "GIS_Remote_Desktop_Work_Unit/Data Layers/Birds_Massive_Processing/Overlap_Result_Layers/All_bird_solar_overlap.xlsx"
+
+# 2. Read the output table
+df <- read.xlsx(excel_path)
+
+# Get all .tif files under the base directory (used for final comparison of unused files)
+all_tifs <- list.files(base_dir, pattern = "\\.tif$", recursive = TRUE, full.names = TRUE)
+# Initialize an empty vector to record used .tif files
+used_tifs <- character()
+# Initialize the result column
+mean_abundance_list <- rep(NA, nrow(df))
+
+# 3. Pre-build a lookup table for species folders (to improve matching speed)
+# Find all subdirectories containing "Batch"
+batch_dirs <- list.dirs(base_dir, recursive = FALSE)
+batch_dirs <- batch_dirs[grepl("Batch", basename(batch_dirs), ignore.case = TRUE)]
+
+# Collect the paths and names of species folders under all Batch folders
+all_sp_dirs <- unlist(lapply(batch_dirs, function(x) list.dirs(x, recursive = FALSE)))
+sp_dir_names <- basename(all_sp_dirs) # Extract pure folder names (assuming they are species names)
+
+# 4. Core loop: Calculate the mean
+for (i in seq_len(nrow(df))) {
+  sp_name <- df$Common_Name[i]
+  
+  if (is.na(sp_name)) next
+  
+  # Find the corresponding species in our collected folder names (ignore case to prevent minor naming flaws)
+  match_idx <- which(tolower(sp_dir_names) == tolower(sp_name))
+  
+  if (length(match_idx) > 0) {
+    # Find the corresponding species folder
+    target_sp_dir <- all_sp_dirs[match_idx[1]]
+    
+    # Get all tif files under this species folder
+    tifs_in_dir <- list.files(target_sp_dir, pattern = "\\.tif$", full.names = TRUE)
+    
+    if (length(tifs_in_dir) > 0) {
+      sums <- numeric(length(tifs_in_dir))
+      
+      # Sum the pixel values of all tif files for the species respectively
+      for (j in seq_along(tifs_in_dir)) {
+        r <- rast(tifs_in_dir[j])
+        sums[j] <- global(r, "sum", na.rm = TRUE)[1, 1]
+        
+        # Record the used tif files
+        used_tifs <- c(used_tifs, tifs_in_dir[j])
+      }
+      
+      # Calculate the mean of the total values of each tif
+      mean_abundance_list[i] <- mean(sums, na.rm = TRUE)
+    }
+  }
+}
+
+# 5. Store the results in a new column and overwrite to save
+df <- df %>%
+  mutate(mean_total_abundance = mean_abundance_list)
+
+write.xlsx(df, excel_path, overwrite = TRUE)
+
+# 6. Data diagnostics: Find species with 0 or NA
+# Note: handle NaN (e.g., mean will produce NaN when all layers are empty data)
+zero_or_na_sp <- df$Common_Name[is.na(df$mean_total_abundance) | df$mean_total_abundance == 0 | is.nan(df$mean_total_abundance)]
+
+# 7. Data diagnostics: Find unused tif files
+# Normalize paths for accurate comparison (remove double slashes)
+all_tifs_norm <- normalizePath(all_tifs, winslash = "/", mustWork = FALSE)
+used_tifs_norm <- normalizePath(used_tifs, winslash = "/", mustWork = FALSE)
+unused_tifs <- setdiff(all_tifs_norm, used_tifs_norm)
+
+# 8. Print result report
+cat("\n================ Processing Complete ================\n")
+cat(sprintf("Total species processed: %d\n", nrow(df)))
+cat(sprintf("Successfully calculated mean and saved to: %s\n\n", excel_path))
+
+cat("--- Warning: Species with a result of 0 or NA ---\n")
+if(length(zero_or_na_sp) > 0) {
+  print(zero_or_na_sp)
+} else {
+  cat("None! All species successfully matched and calculated values greater than 0.\n")
+}
+
+cat("\n--- Note: Number of unused .tif files ---\n")
+cat(sprintf("A total of %d .tif layers were not referenced by the main program.\n", length(unused_tifs)))
+
+# If there are few unused layers, print them directly; if too many, print the first 20 as an example
+if(length(unused_tifs) > 0) {
+  cat("Example list:\n")
+  print(head(unused_tifs, 20))
+}
