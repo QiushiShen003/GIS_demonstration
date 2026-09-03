@@ -1,0 +1,95 @@
+import os
+import glob
+import numpy as np
+import pandas as pd
+import rasterio
+
+# ================= 1. Core Settings =================
+base_dir = r"C:\Users\qs85\Downloads\GIS_Remote_Desktop_Work_Unit\Data Layers\Birds_Massive_Processing\eBird_Layers"
+table_path = r"C:\Users\qs85\Downloads\GIS_Remote_Desktop_Work_Unit\Data Layers\Birds_Massive_Processing\Overlap_Result_Layers\All_bird_solar_overlap.csv"
+
+# [Highly Recommended: Use Filter]
+# If set to an empty string "", it calculates all .tif files in the folder (your original request)
+# If changed to "mean", it only calculates annual/seasonal mean layers and ignores the 52 weekly median layers!
+TIF_FILTER = "" 
+
+# ================= 2. Read Table and Global Scan =================
+df = pd.read_csv(table_path)
+all_tifs = glob.glob(os.path.join(base_dir, '**', '*.tif'), recursive=True)
+used_tifs = []
+mean_abundance_list = [np.nan] * len(df)
+total_species = len(df)
+
+# ================= 3. Build Mapping Table for Species Folders =================
+sp_dirs_mapping = {}
+if os.path.exists(base_dir):
+    for item in os.listdir(base_dir):
+        if "batch" in item.lower():
+            batch_path = os.path.join(base_dir, item)
+            if os.path.isdir(batch_path):
+                for sp_folder in os.listdir(batch_path):
+                    sp_path = os.path.join(batch_path, sp_folder)
+                    if os.path.isdir(sp_path):
+                        sp_name_lower = sp_folder.lower()
+                        # Resolve cross-batch conflicts: use a list to allow the same species to exist in multiple Batch folders
+                        if sp_name_lower not in sp_dirs_mapping:
+                            sp_dirs_mapping[sp_name_lower] = []
+                        sp_dirs_mapping[sp_name_lower].append(sp_path)
+
+# ================= 4. Core Loop Calculation =================
+print(f"Start batch processing raster layers, total {total_species} species...\n" + "="*40)
+
+for i, row in df.iterrows():
+    sp_name = row.get('Common_Name')
+    if pd.isna(sp_name): continue
+        
+    sp_name_lower = str(sp_name).lower()
+    
+    if sp_name_lower in sp_dirs_mapping:
+        target_sp_dirs_list = sp_dirs_mapping[sp_name_lower]
+        tifs_for_this_species = []
+        
+        # Iterate through all Batch folders where the species is located, and recursively search for tifs
+        for target_dir in target_sp_dirs_list:
+            found_tifs = glob.glob(os.path.join(target_dir, "**", "*.tif"), recursive=True)
+            tifs_for_this_species.extend(found_tifs)
+        
+        # Apply filtering logic (exclude unnecessary redundant eBird layers)
+        if TIF_FILTER:
+            tifs_for_this_species = [t for t in tifs_for_this_species if TIF_FILTER.lower() in os.path.basename(t).lower()]
+            
+        if tifs_for_this_species:
+            sums = []
+            for tif_path in set(tifs_for_this_species): # Use set to deduplicate, preventing the same file from being read twice
+                try:
+                    with rasterio.open(tif_path) as src:
+                        arr = src.read(1, masked=True) 
+                        total_val = arr.sum()
+                        sums.append(total_val)
+                        used_tifs.append(os.path.normpath(tif_path).lower()) # Record lowercase paths for final comparison
+                except Exception as e:
+                    pass
+            
+            if sums:
+                mean_abundance_list[i] = np.mean(sums)
+                
+    status = "✅ Success" if not np.isnan(mean_abundance_list[i]) else "⚠️ Skipped (No file)"
+    print(f"[{i + 1}/{total_species}] {sp_name:<25} -> {status}")
+
+# ================= 5. Save Results and Diagnostics =================
+df['mean_total_abundance'] = mean_abundance_list
+df.to_csv(table_path, index=False)
+
+print("\n" + "="*40)
+print(f"All processing complete! Results saved to: {table_path}\n")
+
+# Find truly unreferenced files (strict lowercase comparison)
+all_tifs_norm_lower = {os.path.normpath(p).lower(): p for p in all_tifs}
+unused_lower = set(all_tifs_norm_lower.keys()) - set(used_tifs)
+unused_tifs_original = [all_tifs_norm_lower[p] for p in unused_lower]
+
+print(f"--- Note: A total of {len(unused_tifs_original)} .tif layers were unreferenced. ---")
+if len(unused_tifs_original) > 0:
+    print("Example list:")
+    for t in list(unused_tifs_original)[:15]:
+        print(t)
